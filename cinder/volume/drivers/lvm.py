@@ -26,6 +26,7 @@ from oslo_utils import units
 
 from cinder.brick import exception as brick_exception
 from cinder.brick.local_dev import lvm as lvm
+from cinder import context
 from cinder import exception
 from cinder.i18n import _, _LE, _LI, _LW
 from cinder.image import image_utils
@@ -34,6 +35,8 @@ from cinder.openstack.common import log as logging
 from cinder import utils
 from cinder.volume import driver
 from cinder.volume import utils as volutils
+from cinder.volume import qos_specs
+from cinder.volume import volume_types
 
 LOG = logging.getLogger(__name__)
 
@@ -69,6 +72,8 @@ class LVMVolumeDriver(driver.VolumeDriver):
     """Executes commands relating to Volumes."""
 
     VERSION = '3.0.0'
+
+    lvm_qos_keys = ['readIOPS', 'writeIOPS', 'readBPS', 'writeBPS']
 
     def __init__(self, vg_obj=None, *args, **kwargs):
         # Parent sets db, host, _execute and base config
@@ -188,6 +193,7 @@ class LVMVolumeDriver(driver.VolumeDriver):
         data["driver_version"] = self.VERSION
         data["storage_protocol"] = self.protocol
         data["pools"] = []
+        data['QoS_support'] = True
 
         total_capacity = 0
         free_capacity = 0
@@ -238,6 +244,61 @@ class LVMVolumeDriver(driver.VolumeDriver):
         data["pools"].append(single_pool)
 
         self._stats = data
+
+    def _get_qos_specs(self, ctxt, type_id):
+        """Get QoS specs from volume type."""
+        qos = {}
+        # Set all throttle rate to 0 (no limit)
+        for key in self.lvm_qos_keys:
+            qos[key] = 0
+        volume_type = volume_types.get_volume_type(ctxt, type_id)
+        qos_specs_id = volume_type.get('qos_specs_id')
+
+        # Only accepts qos_specs settings
+        if qos_specs_id is not None:
+            kvs = qos_specs.get_qos_specs(ctxt, qos_specs_id)['specs']
+            for key, value in kvs.iteritems():
+                if ':' in key:
+                    fields = key.split(':')
+                    key = fields[1]
+                if key in self.lvm_qos_keys:
+                    qos[key] = int(value)
+        return qos
+
+    def _set_qos_specs(self, volume, qos):
+        """ Set QoS specs by cgroup blkio throttle."""
+        volume_path = self.local_path(volume)
+        try:
+            dev_num = utils.get_blkdev_major_minor(volume_path)
+        except exception.Error as e:
+            exception_message = (_('Failed to get device number '
+                                   'for blkio throttling: %(error)s'
+                                   % {'error': e}))
+            raise exception.VolumeBackendAPIException(
+                data=exception_message)
+
+        for key in self.lvm_qos_keys:
+            if key == 'readIOPS':
+                policy = 'read_iops_device'
+            if key == 'writeIOPS':
+                policy = 'write_iops_device'
+            if key == 'readBPS':
+                policy = 'read_bps_device'
+            if key == 'writeBPS':
+                policy = 'write_bps_device'
+            cmd = 'echo ' + '\"%s %d\"' % (dev_num, qos[key])
+            cmd += ' > /sys/fs/cgroup/blkio/blkio.throttle.' + policy
+            try:
+                processutils.execute('sh', '-c', cmd,
+                                     root_helper='sudo', run_as_root=True)
+            except processutils.ProcessExecutionError as exc:
+                exception_message = (_('Failed to set blkio '
+                                       'throttling to %(name), '
+                                       'error message was: %(err_msg)s')
+                                     % {'name': volume['name'],
+                                        'err_msg': exc.stderr})
+                raise exception.VolumeBackendAPIException(
+                    data=exception_message)
 
     def check_for_setup_error(self):
         """Verify that requirements are in place to use LVM driver."""
@@ -293,10 +354,14 @@ class LVMVolumeDriver(driver.VolumeDriver):
         if self.configuration.lvm_mirrors:
             mirror_count = self.configuration.lvm_mirrors
 
+        ctxt = context.get_admin_context()
+        type_id = volume['volume_type_id']
+        qos = self._get_qos_specs(ctxt, type_id)
         self._create_volume(volume['name'],
                             self._sizestr(volume['size']),
                             self.configuration.lvm_type,
                             mirror_count)
+        self._set_qos_specs(volume, qos)
 
     def create_volume_from_snapshot(self, volume, snapshot):
         """Creates a volume from a snapshot."""
@@ -316,6 +381,13 @@ class LVMVolumeDriver(driver.VolumeDriver):
                              snapshot['volume_size'] * units.Ki,
                              self.configuration.volume_dd_blocksize,
                              execute=self._execute)
+
+        # copy_volume is executed under bps rate limiting.
+        # So, activate qos settings after copy_volume finished.
+        ctxt = context.get_admin_context()
+        type_id = volume['volume_type_id']
+        qos = self._get_qos_specs(ctxt, type_id)
+        self._set_qos_specs(volume, qos)
 
     def delete_volume(self, volume):
         """Deletes a logical volume."""
@@ -415,6 +487,12 @@ class LVMVolumeDriver(driver.VolumeDriver):
         finally:
             self.delete_snapshot(temp_snapshot)
 
+        # Set blkio throttling to cloned volume
+        ctxt = context.get_admin_context()
+        type_id = volume['volume_type_id']
+        qos = self._get_qos_specs(ctxt, type_id)
+        self._set_qos_specs(volume, qos)
+
     def clone_image(self, context, volume,
                     image_location, image_meta,
                     image_service):
@@ -470,6 +548,12 @@ class LVMVolumeDriver(driver.VolumeDriver):
                                     'err_msg': exc.stderr})
             raise exception.VolumeBackendAPIException(
                 data=exception_message)
+
+        # Set blkio throttling to renamed volume
+        ctxt = context.get_admin_context()
+        type_id = volume['volume_type_id']
+        qos = self._get_qos_specs(ctxt, type_id)
+        self._set_qos_specs(volume, qos)
 
     def manage_existing_get_size(self, volume, existing_ref):
         """Return size of an existing LV for manage_existing.
